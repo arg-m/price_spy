@@ -14,35 +14,28 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel
-from databases import Database
-from sqlalchemy import (
-    create_engine, MetaData, Table, Column,
-    Integer, String, select
-)
-from contextlib import asynccontextmanager
+from sqlalchemy import select
+from contextlib import asynccontextmanager 
+
+from database import database
+from models import products, users, competitors
+import uvicorn
 
 # ----------------------------
-# 1. Настройка базы данных
+# 1. Инициализация приложения
 # ----------------------------
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./db.sqlite3")
-database = Database(DATABASE_URL)
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-metadata = MetaData()
+app = FastAPI()
 
-products = Table(
-    "products", metadata,
-    Column("id",   Integer, primary_key=True),
-    Column("name", String(255), nullable=False, unique=True),
-    Column("sku",  String(50),  unique=True, nullable=True),
-)
-users = Table(
-    "users", metadata,
-    Column("id",              Integer, primary_key=True),
-    Column("username",        String(50), unique=True, nullable=False),
-    Column("hashed_password", String(128),           nullable=False),
-    Column("role",            String(20),            nullable=False),  # 'admin' or 'user'
-)
-metadata.create_all(engine)
+# ----------------------------
+# 2. Шаблоны
+# ----------------------------
+templates = Jinja2Templates(directory="templates")
+
+# main.py
+from models import metadata
+from database import engine  # ← импортируем engine и metadata из models.py
+
+metadata.create_all(engine)  # ← создаём таблицы
 
 # ----------------------------
 # 2. JWT и безопасность
@@ -88,7 +81,8 @@ class Product(ProductCreate):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await database.connect()
-    # если нет ни одного пользователя – создаём admin/user
+
+    # Создаем дефолтных пользователей
     row = await database.fetch_one(select(users).limit(1))
     if not row:
         await database.execute(users.insert().values(
@@ -101,10 +95,19 @@ async def lifespan(app: FastAPI):
             hashed_password=pwd_context.hash("user"),
             role="user"
         ))
+
+    # Создаем конкурента Ozon, если его нет
+    ozon_row = await database.fetch_one(competitors.select().where(competitors.c.name == "Ozon"))
+    if not ozon_row:
+        await database.execute(competitors.insert().values(name="Ozon"))
+
     yield
     await database.disconnect()
 
-app = FastAPI(lifespan=lifespan)
+
+@app.on_event("shutdown")
+async def shutdown():
+    await database.disconnect()
 
 # ----------------------------
 # 5. Утилиты аутентификации
@@ -360,6 +363,28 @@ async def web_logout():
     resp = RedirectResponse("/login", status_code=302)
     resp.delete_cookie("Authorization")
     return resp
+
+
+# ----------------------------
+# 10. Маршрут для запуска парсера
+# ----------------------------
+
+import redis.asyncio as redis
+from fastapi import BackgroundTasks
+
+REDIS_URL = "redis://localhost:6379"
+redis_client = redis.Redis.from_url(REDIS_URL)
+
+@app.post("/parse/trigger")
+async def trigger_ozon_parser(background_tasks: BackgroundTasks, u: User = Depends(require_admin)):
+    rows = await database.fetch_all(select(products))
+    for r in rows:
+        await redis_client.rpush("price_tasks", str(r["id"]))  # добавляем в очередь
+    return {"status": "Задачи добавлены в очередь Redis"}
+
+
+from routes.ozon_routes import router as ozon_router
+app.include_router(ozon_router)
 
 # ----------------------------
 # 8. Запуск приложения
