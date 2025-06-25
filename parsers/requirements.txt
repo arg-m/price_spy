@@ -1,0 +1,2 @@
+selenium==4.33.0
+undetected_chromedriver==3.5.5
